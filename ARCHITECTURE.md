@@ -1,30 +1,123 @@
-# Architecture Overview
+# Architecture Overview (Обзор архитектуры)
 
-## Throttling & Buffering
+В этом документе подробно объясняется, как именно реализованы **троттлинг, буферизация и разделение ответственности**, чтобы UI оставался отзывчивым при высокочастотных обновлениях WebSocket.
 
-- Incoming WebSocket messages are decoded using `src/utils/BinaryDecoder.js` (required). The `OrderBookSocket` service collects decoded updates into an in-memory buffer.
-- A flusher runs at a fixed interval of 100ms (10 FPS) and emits a single combined batch to the UI consumers. This guarantees the DOM updates at most 10 times per second and prevents UI freezes under hundreds of messages/sec.
+## Файлы, на которые стоит обратить внимание
 
-Why this approach:
-- Fixed-interval flushing simplifies reasoning and provides consistent UI update cadence. It also decouples raw socket throughput from render frequency.
-- Buffering minimizes allocation churn by batching many small updates into one processed payload.
+- `src/utils/BinaryDecoder.js` — все входящие сообщения **обязательно** проходят через этот декодер перед любой обработкой.
+- `src/services/socket.ts` — слой приёма данных: декодирование → буферизация → сброс (каждые 100 мс).
+- `src/components/OrderBook.tsx` — UI подписывается на сокет и выполняет группировку и рендеринг.
+- `src/utils/grouping.ts` — чистая функция агрегации ордеров по tick size (покрыта юнит-тестами).
 
-## Data Flow Separation
+## Выполненные цели
 
-- `OrderBookSocket` (src/services/socket.ts): Responsible for connection, decoding via `BinaryDecoder`, buffering, and emitting batched raw updates.
-- `groupOrders` (src/utils/grouping.ts): Stateless processing utility that aggregates price levels according to a tick size.
-- `OrderBook` (src/components/OrderBook.tsx): Presentation layer that subscribes to the socket, requests grouping, and renders UI.
+- Строгое разделение получения данных и рендеринга.
+- Обновление DOM не чаще 10 раз в секунду (10 FPS).
+- Минимальная нагрузка на главный поток при каждом сообщении сокета.
 
-This separation keeps heavy decoding and ingestion logic out of React rendering, and the grouping/aggregation step is a pure function suitable for offloading to a Web Worker if needed.
+---
 
-## Performance Considerations
+## 1) Слой приёма данных (декодирование и буферизация)
 
-- Throttling to 10 FPS prevents layout thrashing and keeps React re-renders bounded.
-- Memoization and controlled state writes ensure only processed snapshots update React state.
-- Grouping is pure and fast; for even higher loads it can be migrated to a Web Worker.
+**Расположение:** `src/services/socket.ts`
 
-## Extensibility
+### Поток обработки
 
-- Web Worker: move `groupOrders` into a worker and postMessage batches from `OrderBookSocket`.
-- Canvas overlay: depth histograms can be drawn once per flush on a single canvas behind the lists.
-- Drift detection: `OrderBookSocket` exposes sequence numbers (`U`/`E`) and can detect gaps; UI can surface alerts.
+1. `ws.onmessage` получает сырое событие.
+2. Payload передаётся в `BinaryDecoder.decode()` (`src/utils/BinaryDecoder.js`), что удовлетворяет требованию *legacy integration*.
+3. Декодированный объект нормализуется до минимальной структуры `DepthUpdate` и добавляется в in-memory буфер `buffer: DepthUpdate[]`.
+
+### Ключевые детали реализации
+
+- `buffer` — обычный массив; операция `push` имеет сложность O(1) и крайне дешева.
+- На этом этапе **не используется React state и не выполняются DOM-операции**, что делает hot-path максимально лёгким.
+
+---
+
+## 2) Сброс буфера с фиксированным интервалом (троттлинг)
+
+**Расположение:** внутри `OrderBookSocket` (тот же файл).
+
+### Механизм
+
+- Используется один `setInterval(..., 100)`, работающий независимо от частоты прихода сообщений.
+- Это задаёт фиксированный интервал сброса **100 мс (10 FPS)**.
+
+При срабатывании flusher’а:
+
+- Если `buffer.length === 0` — немедленный выход.
+- Создаётся объединённый `DepthUpdate`:
+  - конкатенация всех `bids` и `asks`,
+  - копируются последние значения sequence (`U` / `E`),
+  - буфер очищается (`buffer.length = 0`).
+- Объединённый снапшот отправляется всем подписчикам через `subscribe()`.
+
+### Почему выбран фиксированный интервал
+
+- **Детерминированный ритм:** UI получает обновления в предсказуемые моменты времени.
+- **Простота и низкий overhead:** батчинг множества сообщений снижает количество аллокаций и избегает сложной debounce-логики.
+- Хорошо сочетается с чистой и легко тестируемой функцией группировки.
+
+---
+
+## 3) Подписка UI и обработка данных для отображения
+
+**Расположение:** `src/components/OrderBook.tsx`
+
+### Подписка UI
+
+- UI подписывается на эмиссии `OrderBookSocket`.
+- UI **не подписывается напрямую** на `ws.onmessage`.
+- Обработчик подписки записывает снапшот только в `rawRef.current` (React ref), без обновления состояния.
+
+### Планирование фазы рендера
+
+- После записи в `rawRef` планируется вызов `processSnapshot()` через `requestAnimationFrame()`.
+- `processSnapshot()`:
+  - читает текущий `tick` из `tickRef.current`,
+  - вызывает чистую функцию `groupOrders()`,
+  - вычисляет новые массивы `bids` и `asks`.
+
+Перед вызовом `setState`:
+
+- новые массивы сравниваются с текущими,
+- `setBids` / `setAsks` вызываются **только при реальных изменениях** (цена или объём).
+
+Это предотвращает лишние перерисовки React.
+
+### Почему используется `requestAnimationFrame`
+
+- Синхронизирует вычисления с циклом отрисовки браузера.
+- Позволяет браузеру эффективно батчить layout и paint.
+- Тяжёлая логика выполняется:
+  - не чаще интервала сброса,
+  - и не блокирует paint pipeline.
+
+---
+
+## 4) Дополнительные оптимизации
+
+- `tickRef` хранит текущий tick size, поэтому изменение UI-контрола не пересоздаёт подписку на сокет.
+- Проверки на равенство перед `setState` предотвращают ненужные ререндеры.
+
+---
+
+## Как это удовлетворяет требованию  
+**«UI не должен обновляться на каждое сообщение сокета»**
+
+- Hot-path обработки сообщений выполняет только:
+  - декодирование через `BinaryDecoder`,
+  - `buffer.push(update)`.
+- Ни React state, ни DOM не участвуют в обработке каждого сообщения.
+- UI обновляется **только flusher’ом** с интервалом 100 мс — максимум 10 раз в секунду.
+
+---
+
+## Как проверить локально
+
+1. Использовать mock-сокет с высокой нагрузкой:  
+   `src/utils/MockSocket.ts`
+2. Запустить dev-сервер:
+   ```bash
+   npm install
+   npm run dev
